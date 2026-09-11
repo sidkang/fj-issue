@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::time::Duration;
 
 use url::Url;
 
@@ -82,6 +83,7 @@ pub struct Context {
     pub token: Option<String>,
     pub git_origin: Option<String>,
     pub allow_http: bool,
+    pub timeout: Duration,
 }
 
 impl Default for Context {
@@ -93,6 +95,7 @@ impl Default for Context {
             token: None,
             git_origin: None,
             allow_http: false,
+            timeout: Duration::from_secs(30),
         }
     }
 }
@@ -109,6 +112,12 @@ impl Context {
                 .or_else(|| std::env::var("FORGEJO_TOKEN").ok()),
             git_origin: None,
             allow_http: false,
+            timeout: std::env::var("FJI_TIMEOUT_MS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .map(Duration::from_millis)
+                .filter(|d| !d.is_zero())
+                .unwrap_or(Duration::from_secs(30)),
         }
     }
 }

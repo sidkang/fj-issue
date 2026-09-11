@@ -33,7 +33,7 @@ fji -H git.example view owner/repo#12
 
 If you omit `-H`/`-R`, `fji` reads `git remote get-url origin` in `--cwd` (default: current directory). Non-colocated jj repos should pass flags explicitly.
 
-Authenticated requests are HTTPS. Loopback HTTP is allowed for tests.
+Authenticated requests are HTTPS. Loopback HTTP is allowed for tests. Optional `FJI_TIMEOUT_MS` overrides the 30s per-request deadline (used by tests).
 
 ## Commands
 
@@ -73,3 +73,10 @@ fji dep list {N}
 | 4 | 412 blocked (open dependencies) or 409 conflict |
 
 `--help` and `--version` print human text on stdout. Everything else is JSON.
+
+## Tests
+
+```bash
+cargo test
+FJI_LIVE=1 FJI_HOST=git.882816.xyz FJI_REPO=sid/hello-world FJI_TOKEN=... cargo test --test live -- --nocapture
+```

@@ -52,6 +52,14 @@ fn limit_zero_rejected() {
 }
 
 #[test]
+fn invalid_state_is_usage() {
+    let out = bin().args(["list", "--state", "nope"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let err: serde_json::Value = serde_json::from_slice(&out.stderr).unwrap();
+    assert_eq!(err["code"], "usage");
+}
+
+#[test]
 fn missing_token_json() {
     let out = bin()
         .args(["-H", "git.example", "-R", "sid/hello", "view", "1"])

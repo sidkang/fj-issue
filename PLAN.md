@@ -1,6 +1,6 @@
 # fji — agent-first Forgejo issue CLI
 
-Status: accepted and implemented (v0.1.0). Offline tests pass. Live smoke on sid/hello-world passed (create, blocked-by, assign, comment, edit, close-412, close).
+Status: accepted and implemented (v0.1.0). Offline tests plus live frontier smoke on sid/hello-world.
 
 Review disposition: all P1s accepted; P2s accepted (env-only auth; keep `edit` and name it in the outcome; drop `milestone` from the projection; one execution entry point). §11 forks are closed in §11 below.
 

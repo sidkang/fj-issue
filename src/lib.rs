@@ -13,7 +13,7 @@ use error::FjiError;
 pub async fn execute(cmd: Command, ctx: Context) -> Result<serde_json::Value, FjiError> {
     let (issue, extras) = cmd.refs();
     let resolved = resolve(&ctx, issue.as_ref(), &extras)?;
-    let client = Client::connect(&resolved)?;
+    let client = Client::connect(&resolved, ctx.timeout)?;
     let value = match cmd {
         Command::Create {
             title,
