@@ -43,11 +43,30 @@ async fn main() -> ExitCode {
 
     match execute(command, ctx).await {
         Ok(value) => {
-            let mut stdout = io::stdout().lock();
-            if serde_json::to_writer(&mut stdout, &value).is_err() {
+            let mut bytes = match serde_json::to_vec(&value) {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    FjiError::Http {
+                        code: "http",
+                        error: err.to_string(),
+                        http: None,
+                    }
+                    .write_stderr();
+                    return ExitCode::from(2);
+                }
+            };
+            bytes.push(b'\n');
+            if let Err(err) = io::stdout().lock().write_all(&bytes) {
+                if err.kind() != io::ErrorKind::BrokenPipe {
+                    FjiError::Http {
+                        code: "http",
+                        error: err.to_string(),
+                        http: None,
+                    }
+                    .write_stderr();
+                }
                 return ExitCode::from(2);
             }
-            let _ = stdout.write_all(b"\n");
             ExitCode::SUCCESS
         }
         Err(err) => {

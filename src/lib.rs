@@ -107,9 +107,8 @@ impl Command {
             | Command::Close { issue }
             | Command::Reopen { issue }
             | Command::DepList { issue } => (Some(issue.clone()), Vec::new()),
-            Command::DepAdd { issue, blocked_by } | Command::DepRm { issue, blocked_by } => {
-                (Some(issue.clone()), blocked_by.clone())
-            }
+            Command::DepAdd { issue, blocked_by } => (Some(issue.clone()), blocked_by.clone()),
+            Command::DepRm { issue, blocked_by } => (Some(issue.clone()), vec![blocked_by.clone()]),
             Command::List { .. } => (None, Vec::new()),
         }
     }

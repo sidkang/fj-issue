@@ -114,7 +114,7 @@ pub enum DepAction {
     Rm {
         issue: String,
         #[arg(long = "blocked-by", required = true)]
-        blocked_by: Vec<String>,
+        blocked_by: String,
     },
     List {
         issue: String,
@@ -179,7 +179,7 @@ pub enum Command {
     },
     DepRm {
         issue: IssueRef,
-        blocked_by: Vec<IssueRef>,
+        blocked_by: IssueRef,
     },
     DepList {
         issue: IssueRef,
@@ -237,6 +237,9 @@ impl Commands {
                 let limit = limit.unwrap_or(30);
                 if limit < 1 {
                     return Err(FjiError::usage("usage", "--limit must be >= 1"));
+                }
+                if limit == u32::MAX {
+                    return Err(FjiError::usage("usage", "--limit is too large"));
                 }
                 let state = match state.as_str() {
                     "open" => ListState::Open,
@@ -357,7 +360,7 @@ impl Commands {
                 },
                 DepAction::Rm { issue, blocked_by } => Command::DepRm {
                     issue: IssueRef::parse(&issue)?,
-                    blocked_by: parse_refs(&blocked_by)?,
+                    blocked_by: IssueRef::parse(&blocked_by)?,
                 },
                 DepAction::List { issue } => Command::DepList {
                     issue: IssueRef::parse(&issue)?,

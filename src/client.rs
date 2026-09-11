@@ -4,6 +4,9 @@ use forgejo_api::structs::{
     IssueListIssuesQueryState, IssueListIssuesQueryType, IssueListLabelsQuery, IssueMeta,
     StateType,
 };
+use std::future::Future;
+use std::time::Duration;
+
 use forgejo_api::{ApiErrorKind, Auth, Forgejo, ForgejoError};
 use serde_json::Value;
 
@@ -12,6 +15,7 @@ use crate::error::{FailedDep, FjiError};
 use crate::model::{CommentResult, CommentView, IssueView, ListResult, RelIssue, format_time};
 
 const PAGE: u32 = 50;
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const UA: &str = concat!("fj-issue/", env!("CARGO_PKG_VERSION"));
 
 pub struct Client {
@@ -23,7 +27,7 @@ impl Client {
     pub fn connect(resolved: &Resolved) -> Result<Self, FjiError> {
         let api =
             Forgejo::with_user_agent(Auth::Token(&resolved.token), resolved.host_url.clone(), UA)
-                .map_err(map_forgejo)?;
+                .map_err(map_read)?;
         Ok(Self {
             api,
             repo: resolved.repo.clone(),
@@ -63,7 +67,7 @@ impl Client {
                 },
             )
             .await
-            .map_err(map_forgejo)?;
+            .map_err(map_read)?;
         Ok(CommentResult {
             id: comment.id.unwrap_or(0),
             issue: number,
@@ -99,7 +103,7 @@ impl Client {
                 },
             )
             .await
-            .map_err(map_forgejo)?;
+            .map_err(map_read)?;
         self.attach_deps(issue).await
     }
 
@@ -117,23 +121,55 @@ impl Client {
                 },
             )
             .await
-            .map_err(map_forgejo)?;
+            .map_err(map_read)?;
         self.view_without_comments(number).await
     }
 
     pub async fn label_rm(&self, number: i64, labels: Vec<String>) -> Result<IssueView, FjiError> {
         self.ensure_labels_exist(&labels).await?;
-        for label in labels {
-            self.api
-                .issue_remove_label(
-                    self.owner(),
-                    self.name(),
-                    number,
-                    &label,
-                    DeleteLabelsOption { updated_at: None },
-                )
-                .await
-                .map_err(map_forgejo)?;
+        let issue = self.get_issue(number).await?;
+        let remaining: Vec<String> = issue
+            .labels
+            .as_ref()
+            .map(|ls| {
+                ls.iter()
+                    .filter_map(|l| l.name.clone())
+                    .filter(|name| !labels.iter().any(|rm| rm == name))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if remaining.is_empty() {
+            timed_write(
+                self.api
+                    .issue_clear_labels(
+                        self.owner(),
+                        self.name(),
+                        number,
+                        DeleteLabelsOption { updated_at: None },
+                    )
+                    .send(),
+                Some(number),
+                None,
+            )
+            .await?;
+        } else {
+            let values = remaining.into_iter().map(Value::String).collect::<Vec<_>>();
+            timed_write(
+                self.api
+                    .issue_replace_labels(
+                        self.owner(),
+                        self.name(),
+                        number,
+                        IssueLabelsOption {
+                            labels: Some(values),
+                            updated_at: None,
+                        },
+                    )
+                    .send(),
+                Some(number),
+                None,
+            )
+            .await?;
         }
         self.view_without_comments(number).await
     }
@@ -183,7 +219,7 @@ impl Client {
                 },
             )
             .await
-            .map_err(map_forgejo)?;
+            .map_err(map_read)?;
         self.attach_deps(issue).await
     }
 
@@ -219,23 +255,24 @@ impl Client {
         match result {
             Ok(issue) => self.attach_deps(issue).await,
             Err(e) => {
-                let mapped = map_forgejo(e);
-                if matches!(
-                    mapped,
-                    FjiError::Blocked {
-                        blocked_by: None,
-                        ..
+                let mapped = map_forgejo(e, true, Some(number), None);
+                if state == "closed"
+                    && let Ok(current) = self.get_issue(number).await
+                    && current.state != Some(StateType::Closed)
+                    && let Ok((blocked, _)) = self.deps(number).await
+                {
+                    let open: Vec<i64> = blocked
+                        .iter()
+                        .filter(|b| b.state == "open")
+                        .map(|b| b.number)
+                        .collect();
+                    if !open.is_empty() {
+                        return Err(FjiError::Blocked {
+                            error: "cannot close this issue because it still has open dependencies"
+                                .into(),
+                            blocked_by: Some(open),
+                        });
                     }
-                ) {
-                    let blocked_by = self
-                        .deps(number)
-                        .await
-                        .ok()
-                        .map(|(blocked, _)| blocked.into_iter().map(|r| r.number).collect());
-                    return Err(FjiError::Blocked {
-                        error: mapped.to_string(),
-                        blocked_by,
-                    });
                 }
                 Err(mapped)
             }
@@ -277,18 +314,23 @@ impl Client {
                 },
             )
             .await
-            .map_err(map_forgejo)?;
+            .map_err(map_read)?;
         let number = issue.number.ok_or_else(|| FjiError::Http {
             code: "http",
             error: "created issue has no number".into(),
             http: None,
         })?;
         let url = issue_url(&issue);
+        let preserve = |err: FjiError| FjiError::Uncertain {
+            error: err.to_string(),
+            issue_number: Some(number),
+            issue_url: Some(url.clone()),
+        };
         if blocked_by.is_empty() {
-            return self.attach_deps(issue).await;
+            return self.attach_deps(issue).await.map_err(preserve);
         }
         match self.add_deps_inner(number, &url, &blocked_by).await {
-            Ok(()) => self.attach_deps(issue).await,
+            Ok(()) => self.attach_deps(issue).await.map_err(preserve),
             Err(FjiError::PartialDep {
                 error,
                 issue_number,
@@ -316,26 +358,24 @@ impl Client {
         self.view_without_comments(number).await
     }
 
-    pub async fn dep_rm(
-        &self,
-        number: i64,
-        blocked_by: Vec<IssueRef>,
-    ) -> Result<IssueView, FjiError> {
-        for target in blocked_by {
+    pub async fn dep_rm(&self, number: i64, blocked_by: IssueRef) -> Result<IssueView, FjiError> {
+        timed_write(
             self.api
                 .issue_remove_issue_dependencies(
                     self.owner(),
                     self.name(),
                     number,
                     IssueMeta {
-                        index: Some(target.number),
+                        index: Some(blocked_by.number),
                         owner: Some(self.owner().into()),
                         repo: Some(self.name().into()),
                     },
                 )
-                .await
-                .map_err(map_forgejo)?;
-        }
+                .send(),
+            Some(number),
+            None,
+        )
+        .await?;
         self.view_without_comments(number).await
     }
 
@@ -359,6 +399,7 @@ impl Client {
             crate::cli::ListState::Closed => IssueListIssuesQueryState::Closed,
             crate::cli::ListState::All => IssueListIssuesQueryState::All,
         };
+        let searching = search.is_some();
         let query = IssueListIssuesQuery {
             state: Some(state),
             labels: if labels.is_empty() {
@@ -377,12 +418,15 @@ impl Client {
             sort: None,
         };
 
-        let (items, truncated, total_count) = if all {
-            let items = self.list_all(query).await?;
-            (items, false, None)
+        let (items, truncated, mut total_count) = if all {
+            let (items, total) = self.list_all(query).await?;
+            (items, false, total)
         } else {
             self.list_page(query, limit).await?
         };
+        if searching {
+            total_count = None;
+        }
 
         let mut views = Vec::with_capacity(items.len());
         for issue in items {
@@ -413,41 +457,63 @@ impl Client {
         query: IssueListIssuesQuery,
         limit: u32,
     ) -> Result<(Vec<ApiIssue>, bool, Option<i64>), FjiError> {
-        let (headers, mut items) = self
-            .api
-            .issue_list_issues(self.owner(), self.name(), query)
-            .page(1)
-            .page_size(limit + 1)
-            .send()
-            .await
-            .map_err(map_forgejo)?;
-        let truncated = items.len() as u32 > limit;
-        if truncated {
-            items.truncate(limit as usize);
-        }
-        Ok((items, truncated, headers.x_total_count))
+        let want = (limit as usize).saturating_add(1);
+        let (items, total) = self.collect_issues(query, Some(want)).await?;
+        let truncated =
+            items.len() > limit as usize || total.map(|t| t > i64::from(limit)).unwrap_or(false);
+        let mut items = items;
+        items.truncate(limit as usize);
+        Ok((items, truncated, total))
     }
 
-    async fn list_all(&self, query: IssueListIssuesQuery) -> Result<Vec<ApiIssue>, FjiError> {
+    async fn list_all(
+        &self,
+        query: IssueListIssuesQuery,
+    ) -> Result<(Vec<ApiIssue>, Option<i64>), FjiError> {
+        self.collect_issues(query, None).await
+    }
+
+    async fn collect_issues(
+        &self,
+        query: IssueListIssuesQuery,
+        want: Option<usize>,
+    ) -> Result<(Vec<ApiIssue>, Option<i64>), FjiError> {
         let mut page = 1u32;
+        let mut page_size = PAGE;
         let mut all = Vec::new();
+        let mut total = None;
         loop {
-            let (_, items) = self
-                .api
-                .issue_list_issues(self.owner(), self.name(), query.clone())
-                .page(page)
-                .page_size(PAGE)
-                .send()
-                .await
-                .map_err(map_forgejo)?;
+            let (headers, items) = timed_read(
+                self.api
+                    .issue_list_issues(self.owner(), self.name(), query.clone())
+                    .page(page)
+                    .page_size(page_size)
+                    .send(),
+            )
+            .await?;
+            if let Some(count) = headers.x_total_count {
+                total = Some(count);
+            }
             let n = items.len() as u32;
             all.extend(items);
-            if n < PAGE {
+            let have_all = total.map(|t| all.len() as i64 >= t).unwrap_or(false);
+            if have_all || n == 0 {
+                break;
+            }
+            if n < page_size {
+                if page == 1 {
+                    page_size = n.max(1);
+                    page = 2;
+                    continue;
+                }
+                break;
+            }
+            if want.is_some_and(|w| all.len() >= w) {
                 break;
             }
             page += 1;
         }
-        Ok(all)
+        Ok((all, total))
     }
 
     async fn add_deps_inner(
@@ -481,7 +547,7 @@ impl Client {
                             issue_url: Some(url.to_string()),
                         });
                     }
-                    let mapped = map_forgejo(e);
+                    let mapped = map_forgejo(e, true, Some(number), Some(url.to_string()));
                     return Err(FjiError::PartialDep {
                         error: mapped.to_string(),
                         issue_number: number,
@@ -514,7 +580,7 @@ impl Client {
         self.api
             .issue_get_issue(self.owner(), self.name(), number)
             .await
-            .map_err(map_forgejo)
+            .map_err(map_read)
     }
 
     async fn comments(&self, number: i64) -> Result<Vec<CommentView>, FjiError> {
@@ -536,7 +602,7 @@ impl Client {
                 .page_size(PAGE)
                 .send()
                 .await
-                .map_err(map_forgejo)?;
+                .map_err(map_read)?;
             let n = items.len() as u32;
             all.extend(items.into_iter().map(|c| CommentView {
                 id: c.id.unwrap_or(0),
@@ -585,7 +651,7 @@ impl Client {
         let mut page = 1u32;
         let mut all = Vec::new();
         loop {
-            let items = fetch(page).await.map_err(map_forgejo)?;
+            let items = fetch(page).await.map_err(map_read)?;
             let n = items.len() as u32;
             all.extend(items);
             if n < PAGE {
@@ -622,7 +688,7 @@ impl Client {
                 .page_size(PAGE)
                 .send()
                 .await
-                .map_err(map_forgejo)?;
+                .map_err(map_read)?;
             let n = items.len() as u32;
             labels.extend(items);
             if n < PAGE {
@@ -714,7 +780,35 @@ fn current_assignees(issue: &ApiIssue) -> Vec<String> {
 }
 
 fn is_uncertain(err: &ForgejoError) -> bool {
-    matches!(err, ForgejoError::ReqwestError(e) if e.is_timeout() || e.is_request() && !e.is_connect())
+    matches!(err, ForgejoError::ReqwestError(e) if e.is_timeout() || (e.is_request() && !e.is_connect()))
+}
+
+async fn timed_read<T>(fut: impl Future<Output = Result<T, ForgejoError>>) -> Result<T, FjiError> {
+    match tokio::time::timeout(REQUEST_TIMEOUT, fut).await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(err)) => Err(map_forgejo(err, false, None, None)),
+        Err(_) => Err(FjiError::Http {
+            code: "timeout",
+            error: "request timed out".into(),
+            http: None,
+        }),
+    }
+}
+
+async fn timed_write<T>(
+    fut: impl Future<Output = Result<T, ForgejoError>>,
+    issue_number: Option<i64>,
+    issue_url: Option<String>,
+) -> Result<T, FjiError> {
+    match tokio::time::timeout(REQUEST_TIMEOUT, fut).await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(err)) => Err(map_forgejo(err, true, issue_number, issue_url)),
+        Err(_) => Err(FjiError::Uncertain {
+            error: "request timed out".into(),
+            issue_number,
+            issue_url,
+        }),
+    }
 }
 
 fn http_of(err: &FjiError) -> Option<u16> {
@@ -727,20 +821,40 @@ fn http_of(err: &FjiError) -> Option<u16> {
     }
 }
 
-pub fn map_forgejo(err: ForgejoError) -> FjiError {
+fn map_read(err: ForgejoError) -> FjiError {
+    map_forgejo(err, false, None, None)
+}
+
+fn map_forgejo(
+    err: ForgejoError,
+    write: bool,
+    issue_number: Option<i64>,
+    issue_url: Option<String>,
+) -> FjiError {
+    if write && is_uncertain(&err) {
+        return FjiError::Uncertain {
+            error: err.to_string(),
+            issue_number,
+            issue_url,
+        };
+    }
     match err {
         ForgejoError::ApiError(api) => {
             let message = api.message().unwrap_or("forgejo api error").to_string();
-            if message.contains("open dependencies") {
-                return FjiError::Blocked {
-                    error: message,
-                    blocked_by: None,
-                };
-            }
             match api.error_kind() {
                 ApiErrorKind::NotFound { .. } => FjiError::NotFound {
                     error: message,
                     http: Some(404),
+                },
+                ApiErrorKind::Forbidden => FjiError::Http {
+                    code: "http",
+                    error: message,
+                    http: Some(403),
+                },
+                ApiErrorKind::Unauthorized => FjiError::Http {
+                    code: "http",
+                    error: message,
+                    http: Some(401),
                 },
                 ApiErrorKind::Other(status) if status.as_u16() == 412 => FjiError::Blocked {
                     error: message,
@@ -783,13 +897,14 @@ pub fn map_forgejo(err: ForgejoError) -> FjiError {
             error: status.to_string(),
             http: Some(status.as_u16()),
         },
-        ForgejoError::ReqwestError(e) if e.is_timeout() => FjiError::Uncertain {
-            error: e.to_string(),
-            issue_number: None,
-            issue_url: None,
-        },
         ForgejoError::ReqwestError(e) => FjiError::Http {
-            code: if e.is_connect() { "network" } else { "http" },
+            code: if e.is_connect() {
+                "network"
+            } else if e.is_timeout() {
+                "timeout"
+            } else {
+                "http"
+            },
             error: e.to_string(),
             http: e.status().map(|s| s.as_u16()),
         },

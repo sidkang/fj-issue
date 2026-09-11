@@ -130,28 +130,8 @@ pub fn resolve(
         None => None,
     };
 
-    let mut spec_repo: Option<&RepoName> = None;
-    if let Some(issue) = issue
-        && let Some(repo) = issue.repo.as_ref()
-    {
-        spec_repo = Some(repo);
-    }
-    for r in extra_refs {
-        if let Some(repo) = r.repo.as_ref() {
-            if let Some(existing) = spec_repo {
-                if existing != repo {
-                    return Err(FjiError::usage(
-                        "cross_repo_dep",
-                        "v1 does not support cross-repo dependencies",
-                    ));
-                }
-            } else {
-                spec_repo = Some(repo);
-            }
-        }
-    }
-
-    if let (Some(flag), Some(spec)) = (flag_repo.as_ref(), spec_repo)
+    let primary_spec = issue.and_then(|i| i.repo.as_ref());
+    if let (Some(flag), Some(spec)) = (flag_repo.as_ref(), primary_spec)
         && flag != spec
     {
         return Err(FjiError::usage(
@@ -160,7 +140,7 @@ pub fn resolve(
         ));
     }
 
-    let origin = if ctx.host.is_none() || (flag_repo.is_none() && spec_repo.is_none()) {
+    let origin = if ctx.host.is_none() || (flag_repo.is_none() && primary_spec.is_none()) {
         match ctx.git_origin.as_deref() {
             Some(s) => Some(parse_origin(s)?),
             None => git::origin_url(&ctx.cwd)
@@ -172,7 +152,7 @@ pub fn resolve(
         None
     };
 
-    let repo = if let Some(r) = spec_repo {
+    let repo = if let Some(r) = primary_spec {
         r.clone()
     } else if let Some(r) = flag_repo {
         r
@@ -184,6 +164,17 @@ pub fn resolve(
             "pass -R owner/repo or owner/repo#N, or run inside a git checkout with origin",
         ));
     };
+
+    for extra in extra_refs {
+        if let Some(extra_repo) = extra.repo.as_ref()
+            && extra_repo != &repo
+        {
+            return Err(FjiError::usage(
+                "cross_repo_dep",
+                "v1 does not support cross-repo dependencies",
+            ));
+        }
+    }
 
     let host_raw = if let Some(h) = ctx.host.as_deref() {
         h.to_string()
@@ -238,7 +229,12 @@ pub fn normalize_host(raw: &str, allow_http: bool) -> Result<Url, FjiError> {
 }
 
 fn is_loopback(url: &Url) -> bool {
-    matches!(url.host_str(), Some("127.0.0.1" | "::1" | "localhost"))
+    match url.host() {
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        Some(url::Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
+        _ => false,
+    }
 }
 
 pub fn parse_origin(url: &str) -> Result<(String, RepoName), FjiError> {
@@ -352,6 +348,28 @@ mod tests {
     fn http_loopback_ok() {
         let url = normalize_host("http://127.0.0.1:1234", false).unwrap();
         assert_eq!(url.scheme(), "http");
+        let v6 = normalize_host("http://[::1]:1234", false).unwrap();
+        assert_eq!(v6.scheme(), "http");
+    }
+
+    #[test]
+    fn foreign_blocker_does_not_retarget_origin_repo() {
+        let ctx = Context {
+            host: Some("git.example".into()),
+            token: Some("tok".into()),
+            git_origin: Some("https://git.example/alice/project.git".into()),
+            ..Context::default()
+        };
+        let issue = IssueRef::parse("1").unwrap();
+        let dep = IssueRef::parse("bob/other#2").unwrap();
+        let err = resolve(&ctx, Some(&issue), &[dep]).unwrap_err();
+        assert!(matches!(
+            err,
+            FjiError::Usage {
+                code: "cross_repo_dep",
+                ..
+            }
+        ));
     }
 
     #[test]

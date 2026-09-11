@@ -177,8 +177,13 @@ async fn close_blocked() {
     Mock::given(method("PATCH"))
         .and(path("/api/v1/repos/sid/hello-world/issues/5"))
         .respond_with(ResponseTemplate::new(412).set_body_json(json!({
-            "message": "cannot close this issue because it still has open dependencies"
+            "message": "blocked"
         })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/sid/hello-world/issues/5"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(issue_body(5, "child")))
         .mount(&server)
         .await;
     Mock::given(method("GET"))
@@ -301,4 +306,89 @@ async fn list_enrichment_failure() {
     .await
     .unwrap_err();
     assert_eq!(err.exit_code(), 2);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn foreign_blocker_does_not_retarget() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/bob/other/issues/1"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+    let ctx = Context {
+        host: Some(server.uri()),
+        token: Some("tok".into()),
+        git_origin: Some("https://git.example/alice/project.git".into()),
+        ..Context::default()
+    };
+    let err = execute(
+        Command::DepAdd {
+            issue: IssueRef::parse("1").unwrap(),
+            blocked_by: vec![IssueRef::parse("bob/other#2").unwrap()],
+        },
+        ctx,
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(
+        err,
+        FjiError::Usage {
+            code: "cross_repo_dep",
+            ..
+        }
+    ));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn list_paginates_when_server_caps_page_size() {
+    use wiremock::matchers::query_param;
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/sid/hello-world/issues"))
+        .and(query_param("page", "1"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("x-total-count", "5")
+                .set_body_json(json!([issue_body(1, "a"), issue_body(2, "b")])),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/sid/hello-world/issues"))
+        .and(query_param("page", "2"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("x-total-count", "5")
+                .set_body_json(json!([issue_body(3, "c"), issue_body(4, "d")])),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/sid/hello-world/issues"))
+        .and(query_param("page", "3"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("x-total-count", "5")
+                .set_body_json(json!([issue_body(5, "e")])),
+        )
+        .mount(&server)
+        .await;
+    let value = execute(
+        Command::List {
+            state: fj_issue::cli::ListState::Open,
+            labels: vec![],
+            assignee: None,
+            search: None,
+            limit: 10,
+            all: false,
+            no_deps: true,
+        },
+        ctx(&server),
+    )
+    .await
+    .unwrap();
+    assert_eq!(value["truncated"], false);
+    assert_eq!(value["items"].as_array().unwrap().len(), 5);
+    assert_eq!(value["total_count"], 5);
 }
